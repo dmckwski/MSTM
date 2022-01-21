@@ -1,3 +1,3 @@
-Hi!  Located are the files for the multiple sphere T matrix fortran-90 code, D. W Mackowski et al.   The files are contained in the mstm 4.0.zip compressed folder.   
+Hi!  Located here are the files for the multiple sphere T matrix fortran-90 code, D. W Mackowski et al.   The files are contained in the mstm 4.0.zip compressed folder.   
 
 I have included a couple of windows batch files for compiling the code in serial or parallel mode.  For either you will need to install the gfortran compiler, and for the parallel mode you will need to have installed the MSMPI libraries; see the manual for more details.   
