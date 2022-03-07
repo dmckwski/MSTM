@@ -13632,6 +13632,11 @@ endif
       module random_sphere_configuration
       use mpidefs
       implicit none
+      type coll_list
+         logical :: wallcoll
+         integer :: wall,sphere
+         real(8) :: time,collpos(3)
+      end type coll_list
       type l_list
          integer :: index
          type(l_list), pointer :: next
@@ -13647,28 +13652,33 @@ endif
       integer, target :: target_shape,wall_boundary_model,max_number_time_steps
       real(8), private :: pi,fv_crit,time_step
       real(8), private :: minimum_gap,d_cell,target_boundaries(3,2)
-      real(8), target :: target_dimensions(3),psd_sigma,target_width,target_thickness,max_colls_per_sphere
+      real(8), target :: target_dimensions(3),psd_sigma,target_width,target_thickness,max_collisions_per_sphere, &
+                         max_diffusion_cpu_time,max_diffusion_simulation_time
+      real(8) :: sim_timings(10),time_0
       type(c_list), allocatable :: cell_list(:,:,:)
+      type(coll_list), allocatable :: coll_data(:)
       character*1 :: c_temp
       data pi,fv_crit,time_step/3.1415926535897932385d0,0.25d0,.1d0/
       data minimum_gap,sphere_1_fixed,target_shape,psd_sigma/1.0d-3,.false.,0,0.d0/
       data periodic_bc/.true.,.true.,.true./
       data wall_boundary_model/1/
-      data max_number_time_steps,max_colls_per_sphere/1000,20.d0/
+      data max_number_time_steps,max_collisions_per_sphere,max_diffusion_simulation_time/100,3.d0,5.d0/
+      data max_diffusion_cpu_time/100.d0/
 
       contains
 
          subroutine random_cluster_of_spheres(numberspheres,sphereposition,sphereradius,iunit,istatus, &
-            ntsteps,skip_diffusion,use_saved_values)
+            ntsteps,skip_diffusion,use_saved_values,print_progress,simulation_file)
          implicit none
-         logical :: fitok,allin,initial0,initial1,trystage1,skipdif
-         logical, optional :: skip_diffusion,use_saved_values
+         logical :: fitok,allin,initial0,initial1,trystage1,skipdif,pprog,printsim
+         logical, optional :: skip_diffusion,use_saved_values,print_progress
          logical, save :: firstrun
          integer :: i,j,maxsamp0,maxsamp1,numberspheres,ncolls,ncollstot,maxns,ntsteps,istatus,iunit,rank
          real(8) ::samppos(3),sphereposition(3,numberspheres),sphereradius(numberspheres), &
             spherevol,targetfv,u(3,numberspheres),wallboundaries(3,2),targetvol, &
-            targetstretch,collspersphere,mfp,time0,time1,sum1,sum2,sdev,mean
+            targetstretch,collspersphere,mfp,time0,time1,sum1,sum2,sdev,mean,time2
          real(8), allocatable, save :: saved_sphereradius(:),saved_sphereposition(:,:)
+         character*255, optional :: simulation_file
          data maxsamp0,maxsamp1,firstrun/10000,100,.true./
          if(present(use_saved_values)) then
             if(use_saved_values) then
@@ -13682,10 +13692,17 @@ endif
          else
             skipdif=.false.
          endif
+         if(present(print_progress)) then
+            pprog=print_progress
+         else
+            pprog=.false.
+         endif
+         printsim=(present(simulation_file).and.mstm_global_rank.eq.0)
          if(firstrun) then
             call random_seed()
             firstrun=.false.
          endif
+         allocate(coll_data(numberspheres))
          call mstm_mpi(mpi_command='rank',mpi_rank=rank)
          trystage1=.false.
          if(psd_sigma.eq.0.d0) then
@@ -13713,6 +13730,7 @@ endif
          d_cell=2.5d0*maxval(sphereradius(1:numberspheres))
          allin=.false.
          istatus=3
+         sim_timings=0.d0
          if(targetfv.le.0.25d0.or.trystage1) then
             allin=.true.
             call initialize_cells(numberspheres)
@@ -13733,7 +13751,10 @@ endif
             enddo
             if(allin) then
                ntsteps=min(ceiling(2.d0/time_step),max_number_time_steps)
-!               write(iunit,'('' target configuration computed using random sampling'')')
+               if(mstm_global_rank.eq.0.and.pprog) then
+                  write(iunit,'('' target configuration computed using random sampling'')')
+                  call flush(iunit)
+               endif
                istatus=0
             else
                call clear_cells()
@@ -13762,7 +13783,10 @@ endif
                allin=.false.
             else
                ntsteps=min(ceiling(mfp/time_step),max_number_time_steps)
-!               write(iunit,'('' target configuration computed using layered sampling + diffusion, time steps:'',i5)') ntsteps
+               if(mstm_global_rank.eq.0.and.pprog) then
+                  write(iunit,'('' target configuration computed using layered sampling + diffusion, time steps:'',i5)') ntsteps
+                  call flush(iunit)
+               endif
                istatus=1
             endif
          endif
@@ -13787,25 +13811,52 @@ endif
             enddo
             istatus=2
             ntsteps=max_number_time_steps
-!            write(iunit,'('' target configuration computed initial HCP + diffusion, time steps:'',i5)') ntsteps
+            if(mstm_global_rank.eq.0.and.pprog) then
+               write(iunit,'('' target configuration computed initial HCP + diffusion, time steps:'',i5)') ntsteps
+               call flush(iunit)
+            endif
          endif
          do i=1,numberspheres
             call check_in_target(sphereradius(i),sphereposition(:,i),wallboundaries,allin)
 !            if(.not.allin) write(iunit,'('' initially outside:'',i5,3es12.4)') i,sphereposition(:,i)
          enddo
-!         ntsteps=max_number_time_steps
-         if(ntsteps.gt.0..and.(.not.skipdif)) then
+         ntsteps=max_number_time_steps
+         if(printsim) then
+            open(31,file=trim(simulation_file))
+            write(31,'(i8)') numberspheres
+            write(31,'(es13.5)') 0.d0
+            do i=1,numberspheres
+               write(31,'(4es13.5)') sphereposition(:,i),sphereradius(i)
+            enddo
+         endif
+         if(.not.skipdif) then
             call samptrajectory(numberspheres,u)
             ncollstot=0
-            do j=1,ntsteps
-
+            time1=mstm_mpi_wtime()
+            time0=time1
+            do j=1,max_number_time_steps
                call spheremove(numberspheres,sphereradius,sphereposition,u,time_step,wallboundaries, &
                   number_wall_hits=ncolls)
                ncollstot=ncollstot+ncolls
                collspersphere=dble(ncollstot)/dble(numberspheres)
-               if(collspersphere.gt.max_colls_per_sphere) exit
+               time2=mstm_mpi_wtime()
+               if(mstm_global_rank.eq.0.and.pprog.and.time2-time1.gt.15.d0) then
+                  write(iunit,'('' diffusion step, collision per sphere:'',i8,es12.4)') j,collspersphere
+                  call flush(iunit)
+                  time1=mstm_mpi_wtime()
+               endif
+               if(time2-time0.gt.max_diffusion_cpu_time) exit
+               if(j*time_step.gt.max_diffusion_simulation_time) exit
+               if(collspersphere.gt.max_collisions_per_sphere) exit
+               if(printsim) then
+                  write(31,'(es13.5)') j*time_step
+                  do i=1,numberspheres
+                     write(31,'(4es13.5)') sphereposition(:,i),sphereradius(i)
+                  enddo
+               endif
             enddo
             ntsteps=min(ntsteps,j)
+            if(printsim) close(31)
          endif
          do i=1,numberspheres
             call check_in_target(sphereradius(i),sphereposition(:,i),wallboundaries,allin)
@@ -13823,6 +13874,7 @@ endif
          saved_sphereposition=sphereposition
          saved_sphereradius=sphereradius
          call clear_cells()
+         deallocate(coll_data)
          end subroutine random_cluster_of_spheres
 
          subroutine direct_overlap_test(nsphere,radius,position,overlap,distance,pair)
@@ -14356,7 +14408,7 @@ endif
          subroutine spheremove(nsphere,radius,pos,u,maxtime,wallboundaries,number_wall_hits)
          implicit none
          logical :: collision,wallcollision,pbc(3),intarget
-         integer :: nsphere,i,is,js,collisionpair(2),iwall,iswall,m,nwhits
+         integer :: nsphere,i,is,js,collisionpair(2),iwall,iswall,m,nwhits,it
          integer, optional :: number_wall_hits
          real(8) :: pos(3,nsphere),radius(nsphere),maxtime, &
                     tcmin,tmove,u1new(3),u2new(3),u(1:3,nsphere), &
@@ -14371,12 +14423,32 @@ endif
          tmove=maxtime
          i=1
          nwhits=0
+time_0=mstm_mpi_wtime()
+         call trajectorytest(nsphere,radius,pos,u,tmove,wallboundaries, &
+            collision,tcoll,collisionpair)
+sim_timings(1)=sim_timings(1)+mstm_mpi_wtime()-time_0
          do while(tmove.gt.0.d0)
+time_0=mstm_mpi_wtime()
             call modify_cells(nsphere,pos)
-            call trajectorytest(nsphere,radius,pos,u,tmove,wallboundaries, &
-               collision,tcoll,collisionpair,collision_pos=collpos)
+sim_timings(2)=sim_timings(2)+mstm_mpi_wtime()-time_0
+time_0=mstm_mpi_wtime()
+            tcoll=tmove
+            collision=.false.
+            do is=1,nsphere
+               if(coll_data(is)%time.lt.tcoll) then
+                  tcoll=coll_data(is)%time
+                  collision=.true.
+                  collisionpair(1)=is
+                  collisionpair(2)=coll_data(is)%sphere
+                  collpos(:)=coll_data(is)%collpos(:)
+               endif
+            enddo
+sim_timings(3)=sim_timings(3)+mstm_mpi_wtime()-time_0
+time_0=mstm_mpi_wtime()
             tcmin=tcoll
             call walltest(nsphere,radius,pos,u,tmove,wallboundaries,twallmin,iswall,iwall)
+sim_timings(4)=sim_timings(4)+mstm_mpi_wtime()-time_0
+time_0=mstm_mpi_wtime()
             wallcollision=(twallmin.lt.tcmin)
             tcmin=min(tcmin,twallmin)
             do is=1,nsphere
@@ -14399,6 +14471,8 @@ endif
                   write(*,'(8es12.4)') tpos,tcoll,twallmin
                endif
             enddo
+sim_timings(5)=sim_timings(5)+mstm_mpi_wtime()-time_0
+time_0=mstm_mpi_wtime()
             if(tcmin.lt.tmove) then
                nwhits=nwhits+1
                if(wallcollision) then
@@ -14456,8 +14530,21 @@ endif
                endif
             endif
             tmove=tmove-abs(tcmin)
+            coll_data(1:nsphere)%time=coll_data(1:nsphere)%time-abs(tcmin)
+            if(wallcollision) then
+               call trajectorytest(nsphere,radius,pos,u,tmove,wallboundaries, &
+               collision,tcoll,collisionpair,start_sphere=iswall,end_sphere=iswall)
+            elseif(collision) then
+               is=collisionpair(1)
+               js=collisionpair(2)
+               call trajectorytest(nsphere,radius,pos,u,tmove,wallboundaries, &
+               collision,tcoll,collisionpair,start_sphere=is,end_sphere=is)
+               call trajectorytest(nsphere,radius,pos,u,tmove,wallboundaries, &
+               collision,tcoll,collisionpair,start_sphere=js,end_sphere=js)
+            endif
             i=i+1
             if(sphere_1_fixed) u(:,1)=0.d0
+sim_timings(6)=sim_timings(6)+mstm_mpi_wtime()-time_0
          enddo
          if(present(number_wall_hits)) number_wall_hits=nwhits
          end subroutine spheremove
@@ -14610,6 +14697,9 @@ endif
          tcmin=maxtime
          collision=.false.
          do is=istart,iend
+            coll_data(is)%wallcoll=.false.
+            coll_data(is)%time=maxtime
+            coll_data(is)%collpos(:)=pos(:,is)
             call cell_index(pos(:,is),ccell)
             do m=0,26
                scell(1)=mod(m,3)-1
@@ -14645,6 +14735,11 @@ endif
                      call paircollisiontest(tpos(1:3),u(1:3,is),pos(1:3,js),u(1:3,js), &
                           rcol,loccoll,tcollision)
                      if(loccoll) then
+                        if(coll_data(is)%time.gt.tcollision) then
+                           coll_data(is)%time=tcollision
+                           coll_data(is)%sphere=js
+                           coll_data(is)%collpos(:)=tpos(:)
+                        endif
                         if(tcollision.lt.tcmin) then
                            collision=.true.
                            tcmin=tcollision
@@ -14920,7 +15015,7 @@ endif
       implicit none
       logical :: loop_job,repeat_run,first_run,data_scaled,temporary_pos_file, &
          append_near_field_output_file,incident_beta_specified,number_spheres_specified, &
-         square_cell,random_configuration,use_previous_configuration,calculate_up_down_scattering
+         square_cell,use_previous_configuration,calculate_up_down_scattering
       logical, target :: append_output_file, &
                  print_scattering_matrix, &
                  copy_input_file,calculate_near_field, &
@@ -14930,7 +15025,8 @@ endif
                  azimuthal_average,incident_frame,configuration_average, &
                  frozen_configuration,reflection_model,input_fft_translation_option, &
                  print_random_configuration,print_timings, &
-                 input_calculate_up_down_scattering,incidence_average,auto_absorption_sample_radius
+                 input_calculate_up_down_scattering,incidence_average,auto_absorption_sample_radius, &
+                 random_configuration
       logical, allocatable :: sphere_excitation_switch(:)
       integer :: n_nest_loops,i_var_start(5),i_var_stop(5),i_var_step(5), &
                  run_number,loop_sphere_number(5),qeff_dim, &
@@ -14968,7 +15064,8 @@ endif
       character*20 :: run_date_and_time
       character*256 :: loop_var_label(5),input_file
       character*256, target :: output_file,run_file,t_matrix_output_file, &
-            sphere_data_input_file,near_field_output_file,solution_method
+            sphere_data_input_file,near_field_output_file,solution_method, &
+            random_configuration_output_file
       data loop_job,repeat_run/.false.,.false./
       data append_output_file/.false./
       data copy_input_file/.false./
@@ -14987,7 +15084,8 @@ endif
       data t_matrix_convergence_epsilon/1.d-6/
       data output_file/'mstmtest.dat'/
       data run_file/'run1.dat'/
-      data sphere_data_input_file/' '/
+      data random_configuration_output_file/'random_configuration.pos'/
+      data run_file/'run1.dat'/
       data length_scale_factor/1.d0/
       data ref_index_scale_factor/(1.d0,0.d0)/
       data move_to_front,move_to_back/.false.,.false./
@@ -15010,6 +15108,7 @@ endif
       data normalize_s11,print_sphere_data,single_origin_expansion,azimuthal_average/.true.,.true.,.true.,.false./
       data number_spheres_specified,configuration_average/.true.,.false./
       data frozen_configuration,reflection_model,random_configuration_number/.false.,.false.,1/
+      data random_configuration,random_configuration_output_file/.false.,'random_configuration.pos'/
       data min_fft_nsphere,input_fft_translation_option,input_node_order,input_cell_volume_fraction/200,.false.,-1,0.d0/
       data print_random_configuration,print_timings/.false.,.true./
       data input_calculate_up_down_scattering/.true./
@@ -15357,6 +15456,14 @@ endif
             rvarvalue=>input_cell_width_x
             square_cell=.true.
 
+         elseif(varlabel.eq.'random_configuration') then
+            vartype='l'
+            lvarvalue=>random_configuration
+
+         elseif(varlabel.eq.'random_configuration_output_file') then
+            vartype='a'
+            avarvalue=>random_configuration_output_file
+
          elseif(varlabel.eq.'target_dimensions') then
             vartype='r'
             varlen=3
@@ -15381,9 +15488,17 @@ endif
             vartype='r'
             rvarvalue=>psd_sigma
 
-         elseif(varlabel.eq.'max_number_time_steps') then
-            vartype='i'
-            ivarvalue=>max_number_time_steps
+         elseif(varlabel.eq.'max_diffusion_simulation_time') then
+            vartype='r'
+            rvarvalue=>max_diffusion_simulation_time
+
+         elseif(varlabel.eq.'max_diffusion_cpu_time') then
+            vartype='r'
+            rvarvalue=>max_diffusion_cpu_time
+
+         elseif(varlabel.eq.'max_collisions_per_sphere') then
+            vartype='r'
+            rvarvalue=>max_collisions_per_sphere
 
          elseif(varlabel.eq.'number_configurations') then
             vartype='i'
@@ -15696,6 +15811,10 @@ endif
          endif
          averagerun=configuration_average.or.incidence_average
          calculate_up_down_scattering=input_calculate_up_down_scattering
+         if(reflection_model) then
+            calculate_up_down_scattering=.true.
+            incident_frame=.false.
+         endif
 
          first_run=.false.
          call mstm_mpi(mpi_command='rank',mpi_rank=rank,mpi_comm=mpicomm)
@@ -15705,7 +15824,7 @@ endif
          global_rank=rank
          if((.not.configuration_average).and.(.not.incidence_average)) n_configuration_groups=1
 
-         random_configuration=(trim(sphere_data_input_file).eq.'random_configuration')
+!         random_configuration=(trim(sphere_data_input_file).eq.'random_configuration')
          if(random_configuration) then
             if(target_width_specified) then
                if(target_shape.eq.0) then
@@ -15745,8 +15864,8 @@ endif
                write(run_print_unit,'('' generating random configuration:'',$)')
                timet=mstm_mpi_wtime()
             endif
-!            call generate_random_configuration(mpi_comm=mpicomm,skip_diffusion=dryrun)
-            call generate_random_configuration(mpi_comm=mpicomm)
+            call generate_random_configuration(mpi_comm=mpicomm,skip_diffusion=dryrun)
+!            call generate_random_configuration(mpi_comm=mpicomm)
             if(print_timings.and.mstm_global_rank.eq.0) then
                write(run_print_unit,'('' completed, time:'',es12.5,'' s'')') mstm_mpi_wtime()-timet
             endif
@@ -15757,7 +15876,7 @@ endif
                endif
 !               if(print_random_configuration.and.(.not.configuration_average)) then
                if(print_random_configuration.and.mstm_global_rank.eq.0) then
-                  open(2,file='random_configuration.pos')
+                  open(2,file=trim(random_configuration_output_file))
                   do i=1,number_spheres
                      write(2,'(4es13.5)') sphere_position(:,i)/length_scale_factor, &
                         sphere_radius(i)/length_scale_factor
@@ -15980,6 +16099,8 @@ endif
                scat_mat_udim=floor(180.00001d0/scattering_map_increment)
                scat_mat_mdim=16
                scat_mat_ldim=0
+               scat_mat_amin=0.d0
+               scat_mat_amax=180.d0
             endif
          else
             if(incident_beta_specified) then
@@ -16047,7 +16168,6 @@ endif
             if(periodic_lattice.or.reflection_model.and.(target_shape.le.1)) then
                cross_section_radius=cross_section_radius*sqrt(cos(incident_beta))
             endif
-
          endif
 if(light_up) then
 write(*,'('' s7 '',i3)') mstm_global_rank
@@ -17025,7 +17145,7 @@ endif
          if(rank.eq.0) then
             call random_cluster_of_spheres(number_spheres,sphere_position,sphere_radius, &
                run_print_unit,ran_config_stat,ran_config_time_steps, &
-               skip_diffusion=skipdif, &
+               skip_diffusion=skipdif,print_progress=.true., &
                use_saved_values=use_previous_configuration)
             if(ran_config_stat.ge.3) then
                write(run_print_unit,'('' unable to generate random configuration'')')
@@ -17464,7 +17584,7 @@ endif
                do i=scat_mat_ldim,scat_mat_udim
                   smt=scaled_scat_mat(scat_mat(1:16,i))
                   smt(1)=smt(1)*s11scale
-                  call print_scat_mat_row(smt)
+                  call print_scat_mat_row(i,smt)
                enddo
             else
                if(scattering_map_model.eq.0) then
@@ -17482,7 +17602,7 @@ endif
                      do i=scat_mat_ldim,scat_mat_udim
                         smt=scaled_scat_mat(scat_mat(1:16,i))
                         smt(1)=smt(1)*s11scale
-                        call print_scat_mat_row(smt)
+                        call print_scat_mat_row(i,smt)
                      enddo
                      if((configuration_average.or.incidence_average).and.single_origin_expansion) then
                         if(normalize_s11) then
@@ -17496,7 +17616,7 @@ endif
                         do i=scat_mat_ldim,scat_mat_udim
                            smt=scaled_scat_mat(dif_scat_mat(1:16,i))
                            smt(1)=smt(1)*s11scale
-                           call print_scat_mat_row(smt)
+                           call print_scat_mat_row(i,smt)
                         enddo
                      endif
                   else
@@ -17506,14 +17626,14 @@ endif
                      do i=scat_mat_ldim,scat_mat_udim
                         smt=scaled_scat_mat(scat_mat(1:16,i))
                         smt(1)=smt(1)*s11scale
-                        call print_scat_mat_row(smt)
+                        call print_scat_mat_row(i,smt)
                      enddo
                      write(outunit,'('' transmission'')')
                      call print_scat_mat_header(no_numbers=.true.)
                      do i=scat_mat_ldim,scat_mat_udim
                         smt=scaled_scat_mat(scat_mat(17:32,i))
                         smt(1)=smt(1)*s11scale
-                        call print_scat_mat_row(smt)
+                        call print_scat_mat_row(i,smt)
                      enddo
                   endif
                else
@@ -17641,8 +17761,9 @@ endif
             write(outunit,*)
             end subroutine print_scat_mat_header
 
-            subroutine print_scat_mat_row(smt)
+            subroutine print_scat_mat_row(i,smt)
             implicit none
+            integer :: i
             real(8) :: smt(16)
 !            write(outunit,'(f8.2,$)') dble(i)*180.d0/dble(scat_mat_udim-scat_mat_ldim)
             write(outunit,'(f8.2,$)') scat_mat_amin &
