@@ -9,3 +9,5 @@ random_configuration-10
 lmfit 
 mstm-input-37 
 mstm-main-3
+
+For serial platforms replace mpidefs-parallel with mpidefs-serial
